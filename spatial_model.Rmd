@@ -1,0 +1,825 @@
+---
+title: "Spatial separable model"
+output: 
+  html_notebook: 
+    toc: yes
+
+---
+
+This R code is for smoothing positivity rate since its raw data contains lots of 0 and 1. 
+
+## Data process
+
+```{r}
+suppressPackageStartupMessages({
+library(stringi); library(dplyr);library(tidyverse); library(tigris); library(tidycensus); library(tmap); library(readxl); library(INLA); library(spdep);library(ggcorrplot);library(rgdal);library(ggmap);library(ggplot2)})
+
+setwd("/Users/Ana/Downloads/Testing_gap/spatial_temporal_model/")
+load("dat.Rdata")
+
+```
+
+### Testing data
+
+#### Read in COVID19 testing data
+```{r}
+library("DClusterm")
+library(yarrr)
+#### read in raw gap data###
+data_block_gap <- read.csv("processed_data.csv")
+data_block_gap$block_grp <- as.character(data_block_gap$block_grp)
+
+### set the new test frequency to 1, if the positive_freq is NA
+data_block_gap$positive_freq[data_block_gap$test_freq == 0] <- NA
+data_block_gap$new_test_freq <- data_block_gap$test_freq 
+data_block_gap$new_test_freq[data_block_gap$test_freq == 0] <- 1 #to make prediction change 0 to 1
+#View(cbind(new_test_freq, data_block_gap$test_freq))
+
+```
+
+
+```{r}
+data_block_gap %>% dplyr::select(block_grp, week, test_freq, positive_freq, census_pop) %>% arrange(desc(test_freq)) 
+```
+
+### Spatial data
+
+read in the spatial info and merge CBGs where population is 0 with corresponding neighbor.
+```{r}
+#Need to merge tract 980001 to 010203, 980100 to 013206, 990000 to 012305
+#Make the merged tracts have the same ID
+cameron$ID[cameron$TRACTCE=="980100"] <- 225
+cameron$ID[cameron$TRACTCE=="980001"] <- 21
+cameron$ID[cameron$TRACTCE=="990000"] <- 58
+
+
+library(maptools)
+gpclibPermit()
+cameron2 <- unionSpatialPolygons(cameron, cameron$ID)
+
+ # plot(cameron2)
+ # plot(cameron)
+
+cameron.df <- as(cameron, "data.frame")
+cameron.df <- subset(cameron.df, ! cameron.df$TRACTCE %in% c ("980100","980001","990000"))
+row.names(cameron.df) <- as.character(cameron.df$ID)
+
+# Reconvert data frame to SpatialPolygons
+cameron <- SpatialPolygonsDataFrame(cameron2, cameron.df)
+Cameron<- geocode("Cameron county, TX")  #lon -97.5  lat 26.1
+Cameron_center <- c(-97.5, 26.1)
+
+## remove the columns that do not need, and write the shapefile for the selected areas 
+cameron$ID <- NULL
+cameron$FUNCSTAT <- NULL
+#writeOGR(cameron, dsn="Cameron_CBG_222", layer="Cameron_CBG_222", driver="ESRI Shapefile")
+cameron222 <-  readOGR(dsn='Cameron_CBG_222', 'Cameron_CBG_222', verbose=F)
+cameron222$ID <- seq_along(cameron222[,1]) 
+
+### tricks to use for sanity check
+### to find the centroids of each county
+centroids <- coordinates(cameron222)
+### add county names
+plot(cameron222)
+text(centroids, labels=cameron222$GEOID, cex=0.8, col="royalblue") ### not as good as the interactive but can be used for quick and dirty check
+
+```
+
+Generate adjacency matrix
+```{r}
+dat.adj <- poly2nb(cameron222)
+dat.mat <- as(nb2mat(dat.adj, style = "B"), "Matrix")
+
+```
+
+#### Merge testing data with spatial info
+```{r}
+#merge gap data set with spatial info
+data_with_sp <- left_join(data_block_gap, cameron222@data , by = c("block_grp" = "GEOID")) 
+
+dat2 <- data_with_sp %>% 
+  dplyr::select(block_grp, week, test_freq, positive_freq, census_pop, ID) 
+map(dat2, summary)
+```
+
+This dataset is already coded such that if the number of tests are 0, the number of positive cases are NA. This is already done, and there are a total of 651 NAs. The question now is to deal with the offset part. 
+
+```{r}
+summary(data_with_sp$positive_freq)
+```
+
+
+## Models - no interaction
+
+### Model with logit link (default)
+```{r}
+f1  <- positive_freq ~ 1 + f(week, model = "rw1") + f(ID, model = "bym", graph = dat.mat) 
+
+## model with logit link 
+model_logit <-inla(f1, data = data_with_sp,  family = "binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),
+                control.predictor = list(compute = TRUE, link=1))
+summary(model_logit)
+fit1_logit <- model_logit$summary.fitted.value[, 1]
+summary(fit1_logit)
+
+```
+
+### Model with probit link
+```{r}
+model_probit <-inla(f1, data = data_with_sp,  family = "binomial", Ntrials= new_test_freq, control.family = list(link = "probit"),
+                control.predictor = list(compute = TRUE, link=1))
+summary(model_probit)
+fit1_probit <- model_probit$summary.fitted.value[, 1]
+summary(fit1_probit)
+```
+
+### Model with cloglog link
+```{r}
+### cloglog
+model_cloglog <-inla(f1, data = data_with_sp,  family = "binomial", Ntrials= new_test_freq, control.family = list(link = "cloglog"),
+                control.predictor = list(compute = TRUE, link=1))
+summary(model_cloglog)
+fit1_cloglog <- model_cloglog$summary.fitted.value[, 1]
+summary(fit1_cloglog)
+```
+
+
+### Comparison between various outputs
+```{r}
+df <- data_with_sp %>% mutate(rate_posi = positive_freq/test_freq)
+df$rate_logit <- fit1_logit
+df$rate_probit <- fit1_probit
+df$rate_cloglog <- fit1_cloglog
+head(df, n=10)
+```
+
+Now make a plot to compare the estimates 
+```{r}
+tmp <- df %>% pivot_longer(cols=starts_with("rate"), names_to="Mod", values_to="Est")
+head(tmp, n=5)
+ggplot(tmp, aes(week, Est)) + geom_point(aes(colour = factor(Mod)), size = 1)
+```
+
+ 
+Use the simple scatterplot with points color-coded by model. So link functions do not make a lot of different, but compared to the observed there was substantial shrinkage.
+```{r}
+plot(df$rate_logit, df$rate_posi, col=2, xlab="Logit Est", ylab="Est", xlim=c(0, 1), ylim=c(0,1))
+abline(a=0, b=1, col="grey", lwd=2)
+
+points(df$rate_logit, df$rate_cloglog, col=3)
+points(df$rate_logit, df$rate_probit, col=4)
+legend("bottomright", c("observed", "cloglog", "probit"), pch=1, col=c(2, 3, 4), bty="n")
+```
+
+
+```{r}
+plot(df$rate_posi, df$rate_logit, col=2, xlab="Observed Positivity Rate", ylab="Logit Est", xlim=c(0, 1), ylim=c(0,1))
+abline(a=0, b=1, col="grey", lwd=2)
+```
+## Models - with interaction
+
+The fit from this simple spatiotemporal main effects model doesn't appear to be that good. We can try the space-time interaction models to have "less smoothing". These models can be time consuming to run!!!
+
+### Models using rw2 latend effect
+```{r}
+dat3 <- data_with_sp %>% mutate(ID.area = ID, ID.time=week, ID.time2=week, ID.area.time = 1:nrow(data_with_sp))
+#--- Type I interaction ---#
+formula.intI <- positive_freq ~ f(ID.area, model="bym", graph=dat.mat) + f(ID.time, model="rw2") + 
+  f(ID.time2,model="iid") + f(ID.area.time, model="iid")
+mod.intI <- inla(formula.intI, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type II interaction ---#
+dat3$ID.area.int <- dat3$ID.area
+dat3$ID.time.int <- dat3$ID.time
+
+formula.intII <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw2") + f(ID.time2,model="iid") +
+  f(ID.area.int, model="iid", group=ID.time.int, control.group=list(model="rw2")) 
+mod.intII <- inla(formula.intII, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type III interaction ---#
+formula.intIII<- positive_freq ~  f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw2") + f(ID.time2,model="iid") +
+  f(ID.time.int,model="iid", group=ID.area.int, control.group=list(model="besag", graph=dat.mat))
+mod.intIII <- inla(formula.intIII, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type IV interaction ---#
+formula.intIV <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw2") + f(ID.time2,model="iid") + 
+  f(ID.area.int, model="besag", graph=dat.mat, group=ID.time.int,control.group=list(model="rw2"))
+mod.intIV <- inla(formula.intIV, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+```
+ 
+Look at the summary of the models 
+```{r}
+
+summary(mod.intI)
+summary(mod.intII)
+summary(mod.intIII)
+summary(mod.intIV)
+
+```
+ 
+```{r}
+dat3$rate_pos <- dat3$positive_freq/dat3$test_freq
+
+fitI <- mod.intI$summary.fitted.values[, 1]
+fitII <- mod.intII$summary.fitted.values[, 1]
+fitIII <- mod.intIII$summary.fitted.values[, 1]
+fitIV <- mod.intIV$summary.fitted.values[, 1]
+
+
+```
+
+Scatter plot compares the observed positivity rates and the estimated rates.
+```{r}
+par(mfrow=c(2,2))
+plot(dat3$rate_pos, fitI, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 1 - rw2)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+
+plot(dat3$rate_pos, fitII, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 2 - rw2)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+
+plot(dat3$rate_pos, fitIII, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 3 - rw2)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+
+plot(dat3$rate_pos, fitIV, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 4 - rw2)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+```
+
+Check CPO and dic, finish the code, so that we can decide on the best fitting model.
+```{r}
+cpo.rw2 <- c(-sum(log(mod.intI$cpo$cpo), na.rm=T), -sum(log(mod.intII$cpo$cpo), na.rm=T), -sum(log(mod.intIII$cpo$cpo), na.rm=T), -sum(log(mod.intIV$cpo$cpo), na.rm=T))
+pit.rw2 <- c(-sum(log(mod.intI$cpo$pit), na.rm=T), -sum(log(mod.intII$cpo$pit), na.rm=T), -sum(log(mod.intIII$cpo$pit), na.rm=T), -sum(log(mod.intIV$cpo$pit), na.rm=T))
+
+dic.rw2 <- c(mod.intI$dic$dic, mod.intII$dic$dic, mod.intIII$dic$dic, mod.intIV$dic$dic)
+waic.rw2 <-c(mod.intI$waic$waic, mod.intII$waic$waic, mod.intIII$waic$waic, mod.intIV$waic$waic)
+
+#sigma^2 = 1/median
+sigma2.rw2 <- cbind(1/mod.intI$summary.hyperpar$`0.5quant`,
+                1/mod.intII$summary.hyperpar$`0.5quant`,
+                1/mod.intIII$summary.hyperpar$`0.5quant`,
+                1/mod.intIV$summary.hyperpar$`0.5quant`)
+
+tab_rw2 <- rbind(cpo=cpo.rw2, waic=waic.rw2, dic=dic.rw2, sigma2 = sigma2.rw2)
+tab_rw2 <- apply(tab_rw2, 2, function(x){sprintf("%.4f",x)})
+rownames(tab_rw2) <- c("CPO","WAIC","DIC","Sigma^2: spatial_unstructured",
+                       "Sigma^2: spatial_structured", "Sigma^2: time_structured",
+                       "Sigma^2: time_unstructured", "Sigma^2: interaction")
+
+tab_rw2
+
+ # inla.cpo(mod.intI,
+ #          force = FALSE,
+ #          verbose = TRUE,
+ #          recompute.mode = TRUE)
+
+#save(list = c("mod.intIV","mod.intI","mod.intII","mod.intIII"), file="mods_rw2_020722dat.Rdata")
+
+#write.csv(dat3, "data_for_pred_020722.csv")
+```
+
+#### plot of random effect
+```{r}
+###spatial
+par(mfrow=c(2,2))
+spatial1 <- mod.intI$summary.random$ID.area
+spatial2 <- mod.intII$summary.random$ID.area
+spatial3 <- mod.intIII$summary.random$ID.area
+spatial4 <- mod.intIV$summary.random$ID.area
+
+plot(spatial1$mean ~ spatial1$ID)
+plot(spatial2$mean ~ spatial2$ID)
+plot(spatial3$mean ~ spatial3$ID)
+plot(spatial4$mean ~ spatial4$ID)
+
+### structured time
+time_str1 <- mod.intI$summary.random$ID.time
+time_str2 <- mod.intII$summary.random$ID.time
+time_str3 <- mod.intIII$summary.random$ID.time
+time_str4 <- mod.intIV$summary.random$ID.time
+
+plot(time_str1$mean ~ time_str1$ID)
+plot(time_str2$mean ~ time_str2$ID)
+plot(time_str3$mean ~ time_str3$ID)
+plot(time_str4$mean ~ time_str4$ID)
+
+### iid time
+time_unstr1 <- mod.intI$summary.random$ID.time2
+time_unstr2 <- mod.intII$summary.random$ID.time2
+time_unstr3 <- mod.intIII$summary.random$ID.time2
+time_unstr4 <- mod.intIV$summary.random$ID.time2
+
+plot(time_unstr1$mean ~ time_unstr1$ID)
+plot(time_unstr2$mean ~ time_unstr2$ID)
+plot(time_unstr3$mean ~ time_unstr3$ID)
+plot(time_unstr4$mean ~ time_unstr4$ID)
+
+```
+```{r}
+datout <- data.frame(dat3[1:11])
+datout$estimated_pos_rate <- mod.intII$summary.fitted.values[, 1]
+datout$lower_ci <- mod.intII$summary.fitted.values[, 3]
+datout$upper_ci <- mod.intII$summary.fitted.values[, 5]
+#write.csv(datout, "estimated_pos_rate_020722TestData_intII.csv")
+```
+
+### Models using rw1 latent effect
+
+```{r}
+#using random walk of order 1
+#--- Type I interaction ---#
+formula.intI.rw1 <- positive_freq ~ f(ID.area, model="bym", graph=dat.mat) + f(ID.time, model="rw1") + 
+  f(ID.time2,model="iid") + f(ID.area.time, model="iid")
+mod.intI.rw1 <- inla(formula.intI.rw1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type II interaction ---#
+formula.intII.rw1 <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw1") + f(ID.time2,model="iid") +
+  f(ID.area.int, model="iid", group=ID.time.int, control.group=list(model="rw1")) 
+mod.intII.rw1 <- inla(formula.intII.rw1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type III interaction ---#
+formula.intIII.rw1 <- positive_freq ~  f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw1") + f(ID.time2,model="iid") +
+  f(ID.time.int,model="iid", group=ID.area.int, control.group=list(model="besag", graph=dat.mat))
+mod.intIII.rw1 <- inla(formula.intIII.rw1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type IV interaction ---#
+formula.intIV.rw1 <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw1") + f(ID.time2,model="iid") + 
+  f(ID.area.int, model="besag", graph=dat.mat, group=ID.time.int,control.group=list(model="rw1"))
+mod.intIV.rw1 <- inla(formula.intIV.rw1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+```
+
+Look at the summary of the models 
+```{r}
+summary(mod.intI.rw1)
+summary(mod.intII.rw1)
+summary(mod.intIII.rw1)
+summary(mod.intIV.rw1)
+
+```
+
+```{r}
+fitI.rw1 <- mod.intI.rw1$summary.fitted.values[, 1]
+fitII.rw1 <- mod.intII.rw1$summary.fitted.values[, 1]
+fitIII.rw1 <- mod.intIII.rw1$summary.fitted.values[, 1]
+fitIV.rw1 <- mod.intIV.rw1$summary.fitted.values[, 1]
+```
+
+Scatter plot compares the observed positivity rates and the estimated rates.
+```{r}
+par(mfrow=c(2,2))
+plot(dat3$rate_pos, fitI.rw1, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 1 - rw1)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+
+plot(dat3$rate_pos, fitII.rw1, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 2 - rw1)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+
+plot(dat3$rate_pos, fitIII.rw1, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 3 - rw1)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+
+plot(dat3$rate_pos, fitIV.rw1, col=2, xlab="Observed Positivity Rate", ylab="Estimated Positivity Rate (Model 4 - rw1)", xlim=c(0, 1), ylim=c(0,1), cex.lab = 0.7)
+abline(a=0, b=1, col="grey", lwd=2)
+```
+
+Check CPO and dic, finish the code, so that we can decide on the best fitting model.
+```{r}
+cpo.rw1 <- c(-sum(log(mod.intI.rw1$cpo$cpo), na.rm=T), -sum(log(mod.intII.rw1$cpo$cpo), na.rm=T), -sum(log(mod.intIII.rw1$cpo$cpo), na.rm=T), -sum(log(mod.intIV.rw1$cpo$cpo), na.rm=T))
+dic.rw1 <- c(mod.intI.rw1$dic$dic, mod.intII.rw1$dic$dic, mod.intIII.rw1$dic$dic, mod.intIV.rw1$dic$dic)
+waic.rw1 <-c(mod.intI.rw1$waic$waic, mod.intII.rw1$waic$waic, mod.intIII.rw1$waic$waic, mod.intIV.rw1$waic$waic)
+
+#sigma^2 = 1/median
+sigma2.rw1 <- cbind(1/mod.intI.rw1$summary.hyperpar$`0.5quant`,
+                1/mod.intII.rw1$summary.hyperpar$`0.5quant`,
+                1/mod.intIII.rw1$summary.hyperpar$`0.5quant`,
+                1/mod.intIV.rw1$summary.hyperpar$`0.5quant`)
+
+tab_rw1 <- rbind(cpo=cpo.rw1, waic=waic.rw1, dic=dic.rw1, sigma2 = sigma2.rw1)
+tab_rw1 <- apply(tab_rw1, 2, function(x){sprintf("%.4f",x)})
+rownames(tab_rw1) <- c("CPO","WAIC","DIC","Sigma^2: spatial_unstructured",
+                       "Sigma^2: spatial_structured", "Sigma^2: time_structured",
+                       "Sigma^2: time_unstructured", "Sigma^2: interaction")
+
+tab_rw1
+
+#higher the worse 
+# mod.status <- c(mod.intI.rw1$mode$mode.status,
+#                 mod.intII.rw1$mode$mode.status,
+#                 mod.intIII.rw1$mode$mode.status,
+#                 mod.intIV.rw1$mode$mode.status)
+# mod.status
+
+#mod.intI.rw1$logfile
+```
+
+Output estimated positivity rate
+```{r}
+dat3$block_grp <- as.character(dat3$block_grp)
+datout <- data.frame(dat3[1:11])
+datout$estimated_pos_rate <- mod.intI$summary.fitted.values[, 1]
+datout$lower_ci <- mod.intI$summary.fitted.values[, 3]
+datout$upper_ci <- mod.intI$summary.fitted.values[, 5]
+
+```
+### models using rw1 latent effect - without iid time
+
+```{r}
+#using random walk of order 1
+#--- Type I interaction ---#
+formula.intI.rw1.test <- positive_freq ~ f(ID.area, model="bym", graph=dat.mat) + f(ID.time, model="rw1")  + f(ID.area.time, model="iid")
+mod.intI.rw1.test <- inla(formula.intI.rw1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type II interaction ---#
+formula.intII.rw1.test <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw1") + 
+  f(ID.area.int, model="iid", group=ID.time.int, control.group=list(model="rw1")) 
+mod.intII.rw1.test <- inla(formula.intII.rw1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type III interaction ---#
+formula.intIII.rw1.test <- positive_freq ~  f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw1") + 
+  f(ID.time.int,model="iid", group=ID.area.int, control.group=list(model="besag", graph=dat.mat))
+mod.intIII.rw1.test <- inla(formula.intIII.rw1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type IV interaction ---#
+formula.intIV.rw1.test <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="rw1") +  
+  f(ID.area.int, model="besag", graph=dat.mat, group=ID.time.int,control.group=list(model="rw1"))
+mod.intIV.rw1.test <- inla(formula.intIV.rw1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+```
+
+```{r}
+summary(mod.intI.rw1.test)
+summary(mod.intII.rw1.test)
+summary(mod.intIII.rw1.test)
+summary(mod.intIV.rw1.test)
+
+```
+```{r}
+cpo.aw1.test <- c(-sum(log(mod.intI.rw1.test$cpo$cpo), na.rm=T), -sum(log(mod.intII.rw1.test$cpo$cpo), na.rm=T), -sum(log(mod.intIII.rw1.test$cpo$cpo), na.rm=T), -sum(log(mod.intIV.rw1.test$cpo$cpo), na.rm=T))
+dic.aw1.test <- c(mod.intI.rw1.test$dic$dic, mod.intII.rw1.test$dic$dic, mod.intIII.rw1.test$dic$dic, mod.intIV.rw1.test$dic$dic)
+waic.aw1.test <-c(mod.intI.rw1.test$waic$waic, mod.intII.rw1.test$waic$waic, mod.intIII.rw1.test$waic$waic, mod.intIV.rw1.test$waic$waic)
+
+cpo.aw1.test
+dic.aw1.test
+waic.aw1.test
+```
+```{r}
+# save(list = c("mod.intI.rw1.test",
+#               "mod.intII.rw1.test",
+#               "mod.intIII.rw1.test",
+#               "mod.intIV.rw1.test"), file="mod_rw1_without_timeiid.Rdata")
+```
+
+### Models using ar1 latent effect
+
+```{r}
+#using Autoregressive order 1
+#--- Type I interaction ---#
+formula.intI.ar1 <- positive_freq ~ f(ID.area, model="bym", graph=dat.mat) + f(ID.time, model="ar1") + 
+  f(ID.time2,model="iid") + f(ID.area.time, model="iid")
+mod.intI.ar1 <- inla(formula.intI.ar1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type II interaction ---#
+formula.intII.ar1 <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="ar1") + f(ID.time2,model="iid") +
+  f(ID.area.int, model="iid", group=ID.time.int, control.group=list(model="ar1")) 
+mod.intII.ar1 <- inla(formula.intII.ar1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type III interaction ---#
+formula.intIII.ar1 <- positive_freq ~  f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="ar1") + f(ID.time2,model="iid") +
+  f(ID.time.int,model="iid", group=ID.area.int, control.group=list(model="besag", graph=dat.mat))
+mod.intIII.ar1 <- inla(formula.intIII.ar1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type IV interaction ---#
+formula.intIV.ar1 <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="ar1") + f(ID.time2,model="iid") + 
+  f(ID.area.int, model="besag", graph=dat.mat, group=ID.time.int,control.group=list(model="ar1"))
+mod.intIV.ar1 <- inla(formula.intIV.ar1, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+```
+
+Look at the summary of the models 
+```{r}
+summary(mod.intI.ar1)
+summary(mod.intII.ar1)
+summary(mod.intIII.ar1)
+summary(mod.intIV.ar1)
+
+# save(list = c("mod.intI.ar1","mod.intII.ar1","mod.intIII.ar1","mod.intIV.ar1"), 
+#      file = "ar1_model_122021_data.RData")
+```
+Check model
+```{r}
+cpo.ar1 <- c(-sum(log(mod.intI.ar1$cpo$cpo), na.rm=T), -sum(log(mod.intII.ar1$cpo$cpo), na.rm=T), -sum(log(mod.intIII.ar1$cpo$cpo), na.rm=T), -sum(log(mod.intIV.ar1$cpo$cpo), na.rm=T))
+dic.ar1 <- c(mod.intI.ar1$dic$dic, mod.intII.ar1$dic$dic, mod.intIII.ar1$dic$dic, mod.intIV.ar1$dic$dic)
+waic.ar1 <-c(mod.intI.ar1$waic$waic, mod.intII.ar1$waic$waic, mod.intIII.ar1$waic$waic, mod.intIV.ar1$waic$waic)
+
+#sigma^2 = 1/median
+sigma2.ar1 <- cbind(1/mod.intI.ar1$summary.hyperpar$`0.5quant`[c(1,2,3,5,6)],
+                1/mod.intII.ar1$summary.hyperpar$`0.5quant`[c(1,2,3,5,6)],
+                1/mod.intIII.ar1$summary.hyperpar$`0.5quant`[c(1,2,3,5,6)],
+                1/mod.intIV.ar1$summary.hyperpar$`0.5quant`[c(1,2,3,5,6)])
+
+rho_time_median <- c(mod.intI.ar1$summary.hyperpar$`0.5quant`[4],
+                     mod.intII.ar1$summary.hyperpar$`0.5quant`[4],
+                     mod.intIII.ar1$summary.hyperpar$`0.5quant`[4],
+                     mod.intIV.ar1$summary.hyperpar$`0.5quant`[4])
+
+group_rho_area_inte_median <- c(NA, mod.intII.ar1$summary.hyperpar$`0.5quant`[7],
+                         NA, mod.intIV.ar1$summary.hyperpar$`0.5quant`[7])
+
+tab_ar1 <- rbind(cpo=cpo.ar1, waic=waic.ar1, dic=dic.ar1, sigma2 = sigma2.ar1,
+                 rho_time_median, group_rho_area_inte_median)
+
+
+tab_ar1 <- apply(tab_ar1, 2, function(x){sprintf("%.4f",x)})
+rownames(tab_ar1) <- c("CPO","WAIC","DIC","Sigma^2: spatial_unstructured",
+                       "Sigma^2: spatial_structured", "Sigma^2: time_structured",
+                       "Sigma^2: time_unstructured", "Sigma^2: interaction",
+                       "rho_time_median", "group_rho_area_inte_median")
+
+tab_ar1
+```
+
+### Models using ar1 latent effect - without iid time
+
+```{r}
+#using Autoregressive order 1
+#--- Type I interaction ---#
+formula.intI.ar1.test <- positive_freq ~ f(ID.area, model="bym", graph=dat.mat) + f(ID.time, model="ar1") + f(ID.area.time, model="iid")
+mod.intI.ar1.test <- inla(formula.intI.ar1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type II interaction ---#
+formula.intII.ar1.test <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="ar1") + 
+  f(ID.area.int, model="iid", group=ID.time.int, control.group=list(model="ar1")) 
+mod.intII.ar1.test <- inla(formula.intII.ar1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type III interaction ---#
+formula.intIII.ar1.test <- positive_freq ~  f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="ar1") + 
+  f(ID.time.int,model="iid", group=ID.area.int, control.group=list(model="besag", graph=dat.mat))
+mod.intIII.ar1.test <- inla(formula.intIII.ar1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+
+#--- Type IV interaction ---#
+formula.intIV.ar1.test <- positive_freq ~ f(ID.area,model="bym",graph=dat.mat) +
+  f(ID.time,model="ar1") + 
+  f(ID.area.int, model="besag", graph=dat.mat, group=ID.time.int,control.group=list(model="ar1"))
+mod.intIV.ar1.test <- inla(formula.intIV.ar1.test, data=dat3, 
+                 family="binomial", Ntrials= new_test_freq, control.family = list(link = "logit"),  
+                 control.predictor=list(compute=TRUE, link=1), 
+                 control.compute=list(dic=TRUE, cpo=TRUE, waic=TRUE))
+```
+
+Look at the summary of the models 
+```{r}
+summary(mod.intI.ar1.test)
+summary(mod.intII.ar1.test)
+summary(mod.intIII.ar1.test)
+summary(mod.intIV.ar1.test)
+# 
+#  save(list = c("mod.intI.ar1.test","mod.intII.ar1.test","mod.intIII.ar1.test","mod.intIV.ar1.test"), 
+#      file = "ar1_noiidtime_model_122021_data.RData")
+```
+
+```{r}
+write.csv(dat3, file = "data_for_pred.csv")
+```
+
+## Interactive map 
+### Cameron county population - by count
+
+  * CBG:480610142001 	3,816 (2010), 4054 (2019)
+  * CBG:480610125042 	11,659 (2010), 14892 (2019)loaa
+```{r warning=FALSE}
+##extract population data
+block_info <- unique(data_with_sp[,c("block_grp","census_pop")])
+
+#merge pop data with spatial data
+cameron222@data <- merge(cameron222@data, block_info, by.x="GEOID", by.y="block_grp")
+cameron222@data <- cameron222@data[order(cameron222@data$ID),]
+
+##calculate population density
+##unit of ALAND is squared meters
+##unit of pop_density is squared km
+cameron222@data$pop_density <- cameron222@data$census_pop / as.numeric(cameron222@data$ALAND) * 1000000 
+
+library(leaflet)
+# create a interactive map
+l <- leaflet() %>% addTiles()
+# create the color palette (continuous)
+pal <-  colorQuantile(palette = "YlOrRd", domain = cameron222$census_pop, n=5)
+
+# the extra code building off the existing pal
+pal_colors <- unique(pal(sort(cameron222$census_pop))) # hex codes
+pal_labs <- quantile(cameron222$census_pop, seq(0, 1, .2)) # depends on n from pal
+pal_labs <- paste(lag(pal_labs), pal_labs, sep = " - ")[-1] # first lag is NA
+
+
+# add text
+labels <- sprintf("<strong> BG#: %s </strong> <br/> 
+                  Total population: %s <br/> 
+                  Population density (per squared km): %.2f",
+                  cameron222$GEOID, cameron222$census_pop, cameron222$pop_density) %>%
+  lapply(htmltools::HTML)
+
+# add labels to the interactive map
+interactive <-  l %>%
+  addPolygons(
+    group="marker",
+    color = "grey", 
+    weight = 1,
+    fillColor = ~ pal($census_pop), 
+    fillOpacity = 0.5,
+    highlightOptions = highlightOptions(weight = 4),
+    label = labels,
+    labelOptions = labelOptions(
+      style = list( "font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px", direction = "auto")
+  ) %>%
+  addLegend(
+    colors=pal_colors, labels=pal_labs, opacity = 0.5,
+    title = "Cameron county population", position = "bottomright"
+  )
+
+
+options(digits = 3)
+
+
+
+```
+
+### Cameron county population - by population density
+
+```{r}
+# create a interactive map
+l2 <- leaflet() %>% addTiles()
+# create the color palette (continuous)
+pal2 <-  colorQuantile(palette = "YlOrRd", domain = cameron222$pop_density, n=5)
+
+# the extra code building off the existing pal
+pal_colors2 <- unique(pal2(sort(cameron222$pop_density))) # hex codes
+pal_labs2 <- sprintf("%.2f", quantile(cameron222$pop_density, seq(0, 1, .2))) # depends on n from pal
+pal_labs2 <- paste(lag(pal_labs2), pal_labs2, sep = " - ")[-1] # first lag is NA
+
+
+# add text
+labels <- sprintf("<strong> BG#: %s </strong> <br/> 
+                  Total population: %s <br/> 
+                  Population density (per squared km): %.2f",
+                  cameron222$GEOID, cameron222$census_pop, cameron222$pop_density) %>%
+  lapply(htmltools::HTML)
+
+# add labels to the interactive map
+interactive2 <-  l2 %>%
+  addPolygons(
+    group="marker",
+    color = "grey", 
+    weight = 1,
+    fillColor = ~ pal2($pop_density), 
+    fillOpacity = 0.5,
+    highlightOptions = highlightOptions(weight = 4),
+    label = labels,
+    labelOptions = labelOptions(
+      style = list( "font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px", direction = "auto")
+  ) %>%
+  addLegend(
+    colors=pal_colors2, labels=pal_labs2, opacity = 0.5,
+    title = "Cameron county population", position = "bottomright"
+  )
+
+
+options(digits = 3)
+```
+
+**Map of Cameron county population - by count**
+
+<br>
+```{r, echo=FALSE, fig.width=10, fig.height=8}
+interactive
+```
+
+**Map of Cameron county population - by population density**
+
+<br>
+```{r, echo=FALSE, fig.width=10, fig.height=8}
+interactive2
+```
+
+
+
+## Comparing positivity rate observed vs estimated
+```{r echo=FALSE}
+#######function of comparing positivity rate
+dat4 <- data.frame(data_with_sp[1:11])
+dat4$estimated_pos_rate <- mod.intI$summary.fitted.value[,1]
+dat4$lower_ci <- mod.intI$summary.fitted.value[,3]
+dat4$upper_ci <- mod.intI$summary.fitted.value[,5]
+
+  
+library(lubridate)
+all_week <- ymd( "2020-03-16" ) + weeks(1:max(data_block_gap$week) - 1 )
+my_lab <- NULL
+n <- 1
+for (i in 1:(92%/%4)) {
+  n <- 1 + 4*(i-1)
+  my_lab <- c(my_lab, all_week[n])
+}
+my_lab <- as.Date(my_lab, origin = "1970-01-01")
+
+plot_pos_rate <- function(cbg_id){
+    grp <- dat4[dat4$block_grp == cbg_id,]
+    
+    ggplot(grp, aes(x = week)) + 
+              geom_line(aes(y = estimated_pos_rate, color = "Estimated")) + 
+              geom_line(aes(y = positive_rate, color = "Observed")) +
+              geom_ribbon(aes(ymin=lower_ci, ymax=upper_ci), linetype=2, alpha = 0.4)+
+              ylab("Positivity rate") +   
+              theme(strip.background =element_rect(fill="white")) +
+              theme_light() +
+              scale_color_manual("Positivity rate", values = c("Estimated" = "red", "Observed" = "blue")) +
+              ggtitle(paste0("Comparing positivity rate"," - ",cbg_id)) + 
+              scale_x_continuous(breaks = seq(1,92, by = 4), labels = my_lab) +
+              theme(axis.text.x = element_text(angle = 75, vjust = 0.5, size = 5))
+}
+
+
+plot_pos_rate("480610136001")#extreme
+plot_pos_rate("480610120014")#extreme
+plot_pos_rate("480610125042")
+plot_pos_rate("480610144001")
+plot_pos_rate("480610132051")#random select
+plot_pos_rate("480610133031")#random select
+
+plot_pos_rate("480610122005")#contain positivity rate > 1
+
+##output estimated positivity rate
+#write.csv(dat2, "estimated_positivity_rate.csv")
+```
+
+Distribution of positivity rate
+```{r eval=FALSE, include=FALSE}
+hist(dat2$positive_rate, main = "Observed positivity rate")
+hist(model_logit$summary.fitted.value[,1], main = "Fitted positivity rate")
+```
